@@ -8,12 +8,10 @@ import (
 	"log"
 	"net/url"
 	"os"
-	"os/signal"
 	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"runtime/pprof"
 	"sort"
 	"strings"
 	"time"
@@ -52,7 +50,6 @@ var (
 	recursive bool
 	verbose   bool
 	version   bool
-	watch     bool
 	sync      bool
 	bundle    bool
 )
@@ -95,8 +92,6 @@ func run() int {
 	filetype := ""
 	match := ""
 	siteurl := ""
-	cpuprofile := ""
-	memprofile := ""
 
 	cssMinifier := &css.Minifier{}
 	htmlMinifier := &html.Minifier{}
@@ -121,14 +116,11 @@ func run() int {
 	flag.BoolVarP(&hidden, "all", "a", false, "Minify all files, including hidden files and files in hidden directories")
 	flag.BoolVarP(&list, "list", "l", false, "List all accepted filetypes")
 	flag.BoolVarP(&verbose, "verbose", "v", false, "Verbose")
-	flag.BoolVarP(&watch, "watch", "w", false, "Watch files and minify upon changes")
 	flag.BoolVarP(&sync, "sync", "s", false, "Copy all files to destination directory and minify when filetype matches")
 	flag.BoolVarP(&bundle, "bundle", "b", false, "Bundle files by concatenation into a single file")
 	flag.BoolVarP(&version, "version", "", false, "Version")
 
 	flag.StringVar(&siteurl, "url", "", "URL of file to enable URL minification")
-	flag.StringVar(&cpuprofile, "cpuprofile", "", "Export CPU profile")
-	flag.StringVar(&memprofile, "memprofile", "", "Export memory profile")
 	flag.IntVar(&cssMinifier.Precision, "css-precision", 0, "Number of significant digits to preserve in numbers, 0 is all")
 	flag.BoolVar(&htmlMinifier.KeepConditionalComments, "html-keep-conditional-comments", false, "Preserve all IE conditional comments")
 	flag.BoolVar(&htmlMinifier.KeepDefaultAttrVals, "html-keep-default-attrvals", false, "Preserve default attribute values")
@@ -183,39 +175,6 @@ func run() int {
 		return 0
 	}
 
-	if cpuprofile != "" {
-		f, err := os.Create(cpuprofile)
-		if err != nil {
-			Error.Println(err)
-			return 1
-		}
-		if err = pprof.StartCPUProfile(f); err != nil {
-			Error.Println(err)
-			return 1
-		}
-		defer func() {
-			pprof.StopCPUProfile()
-			if err = f.Close(); err != nil {
-				Error.Println(err)
-			}
-		}()
-	}
-
-	if memprofile != "" {
-		defer func() {
-			f, err := os.Create(memprofile)
-			if err != nil {
-				Error.Println(err)
-			}
-			if err = pprof.WriteHeapProfile(f); err != nil {
-				Error.Println(err)
-			}
-			if err = f.Close(); err != nil {
-				Error.Println(err)
-			}
-		}()
-	}
-
 	var err error
 	if match != "" {
 		pattern, err = regexp.Compile(match)
@@ -234,10 +193,7 @@ func run() int {
 		}
 	}
 
-	if (useStdin || output == "") && (watch || sync || recursive) {
-		if watch {
-			Error.Println("--watch doesn't work on stdin and stdout, specify input and output")
-		}
+	if (useStdin || output == "") && (sync || recursive) {
 		if sync {
 			Error.Println("--sync doesn't work on stdin and stdout, specify input and output")
 		}
@@ -281,12 +237,9 @@ func run() int {
 			return 1
 		}
 	}
-	if !dirDst && (sync || watch) {
+	if !dirDst && sync {
 		if sync {
 			Error.Println("--sync requires destination to be a directory")
-		}
-		if watch {
-			Error.Println("--watch requires destination to be a directory")
 		}
 		return 1
 	}
@@ -369,75 +322,8 @@ func run() int {
 		go minifyWorker(mimetype, chanTasks, chanFails)
 	}
 
-	if !watch {
-		for _, task := range tasks {
-			chanTasks <- task
-		}
-	} else {
-		watcher, err := NewWatcher(recursive)
-		if err != nil {
-			Error.Println(err)
-			return 1
-		}
-		defer watcher.Close()
-
-		changes := watcher.Run()
-		for _, task := range tasks {
-			chanTasks <- task
-		}
-
-		autoDir := false
-		for _, root := range roots {
-			watcher.AddPath(root)
-			if root == output {
-				autoDir = true
-			}
-		}
-		skip := map[string]bool{}
-
-		c := make(chan os.Signal, 1)
-		signal.Notify(c, os.Interrupt)
-		for changes != nil {
-			select {
-			case <-c:
-				watcher.Close()
-			case file, ok := <-changes:
-				if !ok {
-					changes = nil
-					break
-				}
-				file = sanitizePath(file)
-
-				// find longest common path among roots
-				root := roots[0]
-				for _, path := range roots[1:] {
-					pathRel, err1 := filepath.Rel(path, file)
-					rootRel, err2 := filepath.Rel(root, file)
-					if err2 != nil || err1 == nil && len(pathRel) < len(rootRel) {
-						root = path
-					}
-				}
-
-				if autoDir && root == output {
-					// skip files in output directory (which is also an input directory) for the first change
-					// skips files that are not minified and stay put as they are not explicitly copied, but that's ok
-					if _, ok := skip[file]; !ok {
-						skip[file] = true
-						break
-					}
-				}
-
-				if !verbose {
-					Info.Println(file, "changed")
-				}
-				task, err := NewTask(root, file, output, !fileMatches(file))
-				if err != nil {
-					Error.Println(err)
-					return 1
-				}
-				chanTasks <- task
-			}
-		}
+	for _, task := range tasks {
+		chanTasks <- task
 	}
 
 	fails := 0
@@ -446,7 +332,7 @@ func run() int {
 		fails += <-chanFails
 	}
 
-	if verbose && !watch {
+	if verbose {
 		Info.Println("finished in", time.Since(start))
 	}
 	if 0 < fails {
